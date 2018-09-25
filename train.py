@@ -17,6 +17,9 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 
+import mobilenetv2
+models.mobilenetv2 = mobilenetv2.MobileNetV2
+
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
@@ -33,20 +36,27 @@ parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
-parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
-                    help='manual epoch number (useful on restarts)')
 parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
-parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
+
+# optimizer
+parser.add_argument('--optimizer', default='Adam', type=str, metavar='OPT',
+                    help='optimizer type (default: Adam)')
+parser.add_argument('--lr', '--learning-rate', default=None, type=float, # 0.1
                     metavar='LR', help='initial learning rate')
-parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
+parser.add_argument('--momentum', default=None, type=float, metavar='M', # 0.9
                     help='momentum')
-parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float,
+parser.add_argument('--nesterov', default=None, type=bool, # True
+                    help='use Nesterov momentum?')
+parser.add_argument('--weight-decay', '--wd', default=None, type=float, # 1e-4
                     metavar='W', help='weight decay (default: 1e-4)')
+
 parser.add_argument('--print-freq', '-p', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
+parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
+                    help='manual epoch number (useful on restarts)')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
@@ -112,9 +122,10 @@ def main():
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
+    optimizer_kwargs = {hyperparam: getattr(args, hyperparam) \
+        for hyperparam in ('lr', 'weight_decay', 'momentum', 'nesterov') \
+        if getattr(args, hyperparam) is not None}
+    optimizer = torch.optim.__dict__[args.optimizer](model.parameters(), **optimizer_kwargs)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -173,7 +184,6 @@ def main():
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        adjust_learning_rate(optimizer, epoch)
 
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch)
@@ -205,6 +215,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
+        if i == 30: break
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -223,6 +234,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
         top5.update(prec5[0], input.size(0))
 
         # compute gradient and do SGD step
+        adjust_learning_rate(optimizer, epoch, epoch * len(train_loader) + i)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -311,9 +323,13 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def adjust_learning_rate(optimizer, epoch):
-    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
+def adjust_learning_rate(optimizer, epoch, global_iteration=None):
+    #"""Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
     lr = args.lr * (0.1 ** (epoch // 30))
+
+    # LR range test
+    #lr = epoch * 3e-2 / args.epochs
+
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
