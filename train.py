@@ -13,9 +13,14 @@ import torch.distributed as dist
 import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
+
+import torchvision
+torchvision.set_image_backend('accimage')
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+
+from tensorboardX import SummaryWriter
 
 import mobilenetv2
 models.mobilenetv2 = mobilenetv2.MobileNetV2
@@ -51,12 +56,15 @@ parser.add_argument('--nesterov', default=None, type=bool, # True
 parser.add_argument('--weight-decay', '--wd', default=None, type=float, # 1e-4
                     metavar='W', help='weight decay (default: 1e-4)')
 
-parser.add_argument('--print-freq', '-p', default=10, type=int,
-                    metavar='N', help='print frequency (default: 10)')
+parser.add_argument('--run-name', default=time.ctime(time.time())[4:-8], type=str, metavar='PATH',
+                    help='path to latest checkpoint (default: none)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
+
+parser.add_argument('--lr-test', action='store_true',
+                    help='do a learning rate test to prepare for superconvergence runs')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
@@ -78,7 +86,7 @@ best_prec1 = 0
 def main():
     global args, best_prec1
     args = parser.parse_args()
-
+    
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -139,7 +147,7 @@ def main():
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
+            raise "=> no checkpoint found at '{}'".format(args.resume)
 
     cudnn.benchmark = True
 
@@ -166,6 +174,7 @@ def main():
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+    train_loader.iter = iter(train_loader)
 
     val_loader = torch.utils.data.DataLoader(
         datasets.ImageFolder(valdir, transforms.Compose([
@@ -177,6 +186,8 @@ def main():
         batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
+    board_writer = SummaryWriter(os.path.join('runs', args.run_name))
+
     if args.evaluate:
         validate(val_loader, model, criterion)
         return
@@ -185,13 +196,20 @@ def main():
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
+        val_loader.iter = iter(val_loader)
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch)
-
+        train_metrics = train(train_loader, model, criterion, optimizer, epoch, board_writer)
+        
+        train_loader.iter = iter(train_loader)
         # evaluate on validation set
-        prec1 = validate(val_loader, model, criterion)
+        val_metrics = validate(val_loader, model, criterion)
 
+        # record metrics to tensorboard
+        for tra,val,name in zip(train_metrics, val_metrics, ('Top 1 accuracy', 'Top 5 accuracy', 'Loss')):
+            board_writer.add_scalars(name, {'Train': tra, 'Test': val}, epoch+1)
+        
         # remember best prec@1 and save checkpoint
+        prec1 = val_metrics[0]
         is_best = prec1 > best_prec1
         best_prec1 = max(prec1, best_prec1)
         save_checkpoint({
@@ -203,7 +221,7 @@ def main():
         }, is_best)
 
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model, criterion, optimizer, epoch, board_writer):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -213,9 +231,12 @@ def train(train_loader, model, criterion, optimizer, epoch):
     # switch to train mode
     model.train()
 
+    total_batches = len(train_loader) if not args.lr_test else 9
+
     end = time.time()
-    for i, (input, target) in enumerate(train_loader):
-        if i == 30: break
+    for i, (input, target) in enumerate(train_loader.iter):
+        if i > total_batches: break
+
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -234,7 +255,8 @@ def train(train_loader, model, criterion, optimizer, epoch):
         top5.update(prec5[0], input.size(0))
 
         # compute gradient and do SGD step
-        adjust_learning_rate(optimizer, epoch, epoch * len(train_loader) + i)
+        global_iteration = epoch * total_batches + i
+        adjust_learning_rate(optimizer, epoch, i, total_batches)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -243,15 +265,17 @@ def train(train_loader, model, criterion, optimizer, epoch):
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if i % args.print_freq == 0:
-            print('Epoch: [{0}][{1}/{2}]\t'
-                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                   epoch, i, len(train_loader), batch_time=batch_time,
-                   data_time=data_time, loss=losses, top1=top1, top5=top5))
+        board_writer.add_scalar('Learning rate',
+            next(iter(optimizer.param_groups))['lr'], global_iteration)
+        board_writer.add_scalars('Time',
+            {'Total batch time': batch_time.val,
+             'Data loading time': data_time.val}, global_iteration)
+        board_writer.add_scalar('Online batch loss', losses.val, global_iteration)
+        board_writer.add_scalars('Online accuracies',
+            {'Top1 accuracy': top1.val,
+             'Top5 accuracy': top5.val}, global_iteration)
+
+    return top1.avg, top5.avg, losses.avg
 
 
 def validate(val_loader, model, criterion):
@@ -265,7 +289,7 @@ def validate(val_loader, model, criterion):
 
     with torch.no_grad():
         end = time.time()
-        for i, (input, target) in enumerate(val_loader):
+        for i, (input, target) in enumerate(val_loader.iter):
             if args.gpu is not None:
                 input = input.cuda(args.gpu, non_blocking=True)
             target = target.cuda(args.gpu, non_blocking=True)
@@ -284,19 +308,7 @@ def validate(val_loader, model, criterion):
             batch_time.update(time.time() - end)
             end = time.time()
 
-            if i % args.print_freq == 0:
-                print('Test: [{0}/{1}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                      'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                       i, len(val_loader), batch_time=batch_time, loss=losses,
-                       top1=top1, top5=top5))
-
-        print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
-              .format(top1=top1, top5=top5))
-
-    return top1.avg
+    return top1.avg, top5.avg, losses.avg
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
@@ -323,12 +335,32 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def adjust_learning_rate(optimizer, epoch, global_iteration=None):
+def adjust_learning_rate(optimizer, epoch, epoch_iteration=None, iters_per_epoch=None):
     #"""Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    lr = args.lr * (0.1 ** (epoch // 30))
+    #lr = args.lr * (0.1 ** (epoch // 30))
+
+    # Super-Convergence
+    MAX_LR = 3.2292e-3 #4.5e-3
+    MIN_LR = MAX_LR / 12
+    END_LR = 3e-7
+    total_iterations = args.epochs * iters_per_epoch
+
+    stage1_start = round(0.0 * args.epochs * 5/6) * iters_per_epoch
+    stage2_start = round(0.5 * args.epochs * 5/6) * iters_per_epoch
+    stage3_start = round(1.0 * args.epochs * 5/6) * iters_per_epoch
+
+    global_iteration = epoch*iters_per_epoch + epoch_iteration
+
+    if global_iteration < stage2_start:
+        lr = MIN_LR + (MAX_LR-MIN_LR) * (global_iteration-stage1_start) / (stage2_start-stage1_start)
+    elif global_iteration < stage3_start:
+        lr = MAX_LR - (MAX_LR-MIN_LR) * (global_iteration-stage2_start) / (stage3_start-stage2_start)
+    else:
+        lr = MIN_LR - (MIN_LR-END_LR) * (global_iteration-stage3_start) / (total_iterations-stage3_start)
 
     # LR range test
-    #lr = epoch * 3e-2 / args.epochs
+    if args.lr_test:
+        lr = epoch * 3e-2 / args.epochs
 
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
