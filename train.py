@@ -63,8 +63,10 @@ parser.add_argument('--weight-decay', '--wd', default=None, type=float, # 1e-4
                     help='Weight decay (default: 1e-4)')
 
 # Distributed (multi-node) training
-parser.add_argument('--world-size', default=1, type=int,
+parser.add_argument('--world_size', default=1, type=int,
                     help='Total number of distributed processes (DO NOT SET)')
+parser.add_argument('--local_rank', default=0, type=int,
+                    help='The index of this process within this machine\'s training processes (DO NOT SET)')
 parser.add_argument('--rank', default=0, type=int,
                     help='The index of this process within all training processes (DO NOT SET)')
 parser.add_argument('--dist-url', default='env://', type=str,
@@ -86,7 +88,7 @@ def main():
         random.seed(args.seed)
         torch.manual_seed(args.seed)
 
-    is_distributed = args.world_size > 1
+    is_distributed = args.world_size > 1 or torch.cuda.device_count() > 0
 
     if is_distributed:
         torch.distributed.init_process_group(
@@ -98,12 +100,11 @@ def main():
         print("'--pretrained' is set, so loading pre-trained weights from torchvision")
     model = torchvision.models.__dict__[args.architecture](pretrained=args.pretrained)
 
+    torch.cuda.set_device(args.local_rank)
+    model = model.to(args.device)
+
     if is_distributed:
         model = torch.nn.parallel.DistributedDataParallel(model)
-        if args.device == 'cuda':
-            torch.cuda.set_device(args.rank)
-
-    model = model.to(args.device)
 
     # Define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().to(args.device)
