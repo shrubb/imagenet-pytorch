@@ -88,11 +88,11 @@ def main():
         random.seed(args.seed)
         torch.manual_seed(args.seed)
 
-    is_distributed = args.world_size > 1 or torch.cuda.device_count() > 0
+    is_distributed = args.world_size > 1
 
     if is_distributed:
         torch.distributed.init_process_group(
-            backend=args.dist_backend, init_method=args.dist_url, world_size=args.world_size)
+            backend=args.dist_backend, init_method=args.dist_url) #, world_size=args.world_size)
 
     # Create model
     print(f"Will train '{args.architecture}' architecture")
@@ -100,11 +100,15 @@ def main():
         print("'--pretrained' is set, so loading pre-trained weights from torchvision")
     model = torchvision.models.__dict__[args.architecture](pretrained=args.pretrained)
 
-    torch.cuda.set_device(args.local_rank)
+    if args.device == 'cuda':
+        torch.cuda.set_device(args.local_rank)
+        args.device = f'cuda:{args.local_rank}'
+
     model = model.to(args.device)
 
     if is_distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model)
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[args.local_rank], output_device=args.local_rank)
 
     # Define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().to(args.device)
@@ -120,7 +124,7 @@ def main():
             print(f"Loading checkpoint '{args.resume}'...")
             start_time = time.time()
 
-            checkpoint = torch.load(args.resume)
+            checkpoint = torch.load(args.resume, map_location=args.device)
             args.iteration = checkpoint['iteration'] * checkpoint['batch_size'] // args.batch_size
             best_top1_accuracy = checkpoint['best_top1_accuracy']
             model.load_state_dict(checkpoint['state_dict'])
@@ -183,7 +187,8 @@ def main():
     checkpoints_directory.mkdir(exist_ok=True)
     
     # Initialize tensorboard logger
-    tensorboard_writer = SummaryWriter(str(output_directory))
+    if args.rank == 0:
+        tensorboard_writer = SummaryWriter(str(output_directory))
 
     if args.evaluate:
         validate(val_loader, model, criterion)
@@ -200,25 +205,26 @@ def main():
         val_metrics = validate(val_loader, model, criterion)
 
         # Record metrics to tensorboard
-        for tra,val,name in zip(train_metrics, val_metrics, ('Top 1 accuracy', 'Top 5 accuracy', 'Loss')):
-            tensorboard_writer.add_scalar(f"Train/{name}", tra, args.iteration)
-            tensorboard_writer.add_scalar(f"Validation/{name}", val, args.iteration)
-        
-        # Save checkpoint
-        top1_accuracy = val_metrics[0]
-        best_top1_accuracy = max(top1_accuracy, best_top1_accuracy)
+        if args.rank == 0:
+            for tra,val,name in zip(train_metrics, val_metrics, ('Top 1 accuracy', 'Top 5 accuracy', 'Loss')):
+                tensorboard_writer.add_scalar(f"Train/{name}", tra, args.iteration)
+                tensorboard_writer.add_scalar(f"Validation/{name}", val, args.iteration)
+            
+            # Save checkpoint
+            top1_accuracy = val_metrics[0]
+            best_top1_accuracy = max(top1_accuracy, best_top1_accuracy)
 
-        torch.save({
-            'iteration': args.iteration,
-            'batch_size': args.batch_size,
-            'architecture': args.architecture,
-            'state_dict': model.state_dict(),
-            'best_top1_accuracy': best_top1_accuracy,
-            'optimizer' : optimizer.state_dict(),
-        }, checkpoints_directory / "last.pth")
+            torch.save({
+                'iteration': args.iteration,
+                'batch_size': args.batch_size,
+                'architecture': args.architecture,
+                'state_dict': model.state_dict(),
+                'best_top1_accuracy': best_top1_accuracy,
+                'optimizer' : optimizer.state_dict(),
+            }, checkpoints_directory / "last.pth")
 
-        if top1_accuracy > best_top1_accuracy: # this checkpoint is better than all previous ones
-            shutil.copy(checkpoints_directory / "last.pth", checkpoints_directory / "best.pth")
+            if top1_accuracy > best_top1_accuracy: # this checkpoint is better than all previous ones
+                shutil.copy(checkpoints_directory / "last.pth", checkpoints_directory / "best.pth")
 
 
 def train(train_loader, model, criterion, optimizer, tensorboard_writer):
@@ -259,13 +265,14 @@ def train(train_loader, model, criterion, optimizer, tensorboard_writer):
         # Measure elapsed time
         total_batch_time = time.time() - data_loading_start_time
 
-        tensorboard_writer.add_scalar('Train/Learning rate',
-            next(iter(optimizer.param_groups))['lr'], args.iteration)
-        tensorboard_writer.add_scalar('Train/Time/Total batch time', total_batch_time, args.iteration)
-        tensorboard_writer.add_scalar('Train/Time/Data loading time', data_loading_time, args.iteration)
-        tensorboard_writer.add_scalar('Online batch loss', losses.last_value, args.iteration)
-        tensorboard_writer.add_scalar('Online accuracies/Top1', top1.last_value, args.iteration)
-        tensorboard_writer.add_scalar('Online accuracies/Top5', top5.last_value, args.iteration)
+        if args.rank == 0:
+            tensorboard_writer.add_scalar('Train/Learning rate',
+                next(iter(optimizer.param_groups))['lr'], args.iteration)
+            tensorboard_writer.add_scalar('Train/Time/Total batch time', total_batch_time, args.iteration)
+            tensorboard_writer.add_scalar('Train/Time/Data loading time', data_loading_time, args.iteration)
+            tensorboard_writer.add_scalar('Online batch loss', losses.last_value, args.iteration)
+            tensorboard_writer.add_scalar('Online accuracies/Top1', top1.last_value, args.iteration)
+            tensorboard_writer.add_scalar('Online accuracies/Top5', top5.last_value, args.iteration)
 
         args.iteration += 1
         data_loading_start_time = time.time()
